@@ -1,0 +1,29 @@
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime
+import boto3
+
+def trigger_dms_task():
+    client = boto3.client('dms', region_name='your-region')
+    response = client.start_replication_task(
+        ReplicationTaskArn='your-replication-task-arn',
+        StartReplicationTaskType='start-replication'
+    )
+    print(response)
+
+default_args = {
+    'owner': 'airflow',
+    'start_date': datetime(2024, 4, 10),
+    'retries': 1,
+}
+
+with DAG('trigger_dms_task_dag', 
+         default_args=default_args,
+         schedule_interval=None) as dag:
+
+    trigger_task = PythonOperator(
+        task_id='trigger_dms_task',
+        python_callable=trigger_dms_task
+    )
+
+    trigger_task
