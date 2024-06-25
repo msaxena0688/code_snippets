@@ -1,0 +1,165 @@
+import sys
+import pyspark
+import boto3
+import yaml
+from pyspark.sql import SparkSession
+from pyspark.context import SparkContext
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, lit, expr, to_timestamp, to_date, rank, max as max_, input_file_name
+from pyspark.sql.types import StringType, IntegerType, DateType
+from datetime import datetime, timedelta
+from pyspark.sql.window import Window
+import re
+
+def load_config(config_path):
+    with open(config_path, 'r') as config_file:
+        config = yaml.safe_load(config_file)
+    return config
+
+def initialize_spark_context():
+    sparkSession = SparkContext.getOrCreate()
+    glueContext = GlueContext(sparkSession)
+    spark = glueContext.spark_session
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+    hadoop_conf.set("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    return spark
+
+def list_all_s3_paths(bucket, prefix):
+    s3_client = boto3.client('s3')
+    paths = []
+    paginator = s3_client.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            paths.append(obj['Key'])
+    return paths
+
+def extract_partition_date(file_path):
+    match = re.search(r"year=(\d+)/month=(\d+)/day=(\d+)", file_path)
+    if match:
+        year, month, day = match.groups()
+        return int(f"{year}{month.zfill(2)}{day.zfill(2)}")
+    return None
+
+def get_new_file_paths(s3_source_path, max_partition_date):
+    bucket_name = s3_source_path.split('/')[2]
+    prefix = '/'.join(s3_source_path.split('/')[3:])
+    all_paths = list_all_s3_paths(bucket_name, prefix)
+    csv_paths = [path for path in all_paths if path.endswith('.csv')]
+    new_file_paths = [path for path in csv_paths if extract_partition_date(path) > max_partition_date]
+    return bucket_name, new_file_paths
+
+def read_and_prepare_data(spark, s3_source_path, load_type, athena_database, athena_table):
+    if load_type == 'FULL':
+        source_df = spark.read.option("header", "true").csv(s3_source_path)
+        source_df = source_df.withColumn('partition_date', expr("cast(concat(year, lpad(month, 2, '0'), lpad(day, 2, '0')) as int)"))
+    else:
+        query = f"SELECT MAX(partition_date) as max_partition_date from {athena_database}.{athena_table}"
+        result = spark.sql(query).collect()[0]
+        max_partition_date = result["max_partition_date"]
+
+        if max_partition_date is None:
+            start_date = datetime.strptime("20220101", "%Y%m%d")
+        else:
+            start_date = datetime.strptime(str(max_partition_date), "%Y%m%d") + timedelta(days=1)
+
+        bucket_name, new_file_paths = get_new_file_paths(s3_source_path, max_partition_date)
+
+        if not new_file_paths:
+            print("No new files to process")
+            return None
+
+        source_df = spark.read.option("header", "true").csv([f"s3://{bucket_name}/{path}" for path in new_file_paths])
+        partition_dates = [extract_partition_date(path) for path in new_file_paths]
+        partition_date_df = spark.createDataFrame(zip(new_file_paths, partition_dates), schema=["path", "partition_date"])
+        partition_date_df = partition_date_df.withColumn("path", expr(f"concat('s3://{bucket_name}/', path)"))
+        source_df = source_df.withColumn("path", input_file_name())
+        source_df = source_df.join(partition_date_df, source_df["path"] == partition_date_df["path"]).drop("path")
+
+    return source_df
+
+def process_data(source_df, run_date, column_mapping):
+    for old_name, new_name in column_mapping.items():
+        source_df = source_df.withColumnRenamed(old_name, new_name)
+
+    source_df = source_df.withColumn("lastmodifieddate_ts", to_timestamp(col("lastmodifieddate"), "yyyy-MM-dd HH:mm:ss"))
+    window_spec = Window.partitionBy("case_number__c").orderBy(col("lastmodifieddate_ts").desc())
+    source_df = source_df.withColumn("rank", rank().over(window_spec)).filter(col("rank") == 1).drop("rank", "lastmodifieddate_ts")
+    source_df = source_df.withColumn('load_date', lit(run_date).cast(DateType()))
+    return source_df
+
+def cast_columns(source_df, column_types):
+    for column, dtype in column_types.items():
+        source_df = source_df.withColumn(column, col(column).cast(dtype))
+    source_df = source_df.select([col(c) for c in column_types.keys()])
+    return source_df
+
+def merge_with_existing_data(spark, source_df, athena_database, athena_table):
+    existing_data_df = spark.sql(f"SELECT * from {athena_database}.{athena_table}")
+    source_df = source_df.union(existing_data_df).dropDuplicates()
+    source_df.cache()
+    source_df.count()
+    return source_df
+
+def save_data(source_df, s3_csv_target_path, s3_parquet_target_path):
+    source_df.write.option("header", "true").option("delimiter", "|").mode("overwrite").csv(s3_csv_target_path)
+    source_df.write.mode("overwrite").parquet(s3_parquet_target_path)
+
+def main():
+    config = load_config('config.yaml')
+    spark = initialize_spark_context()
+    s3_source_path = config['s3_source_path']
+    s3_csv_target_path = config['s3_csv_target_path']
+    s3_parquet_target_path = config['s3_parquet_target_path']
+    athena_database = config['athena_database']
+    athena_table = config['athena_table']
+    run_date = datetime.now().strftime("%Y-%m-%d")
+
+    load_type = 'DELTA'  # This should be passed as an argument in production
+
+    column_mapping = {
+        "casenumber": "case_number__c",
+        "sr_created_date": "createddate",
+        "sr_last_modified_date": "lastmodifieddate",
+        "service_request_type": "sr_type",
+        "combo_product": "product_list__c",
+        "hcp_mdm_id": "hcp_mdm_id__c",
+        "hcp_prescriber_address_line_1": "hcp_prescriber_add_line_1__c",
+        "hcp_prescriber_address_line_2": "hcp_prescriber_add_line_2__c",
+        "hcp_state": "hcp_state__c",
+        "hcp_city": "hcp_city__c",
+        "hcp_zip": "hcp_zip__c",
+        "frm_hco_account_id": "frm_hco_account__c"
+    }
+
+    column_types = {
+        "case_number__c": StringType(),
+        "createddate": DateType(),
+        "lastmodifieddate": DateType(),
+        "sr_type": StringType(),
+        "product_list__c": StringType(),
+        "hcp_mdm_id__c": StringType(),
+        "hcp_prescriber_add_line_1__c": StringType(),
+        "hcp_prescriber_add_line_2__c": StringType(),
+        "hcp_state__c": StringType(),
+        "hcp_city__c": StringType(),
+        "hcp_zip__c": StringType(),
+        "frm_hco_account__c": StringType(),
+        "partition_date": IntegerType(),
+        "load_date": DateType()
+    }
+
+    source_df = read_and_prepare_data(spark, s3_source_path, load_type, athena_database, athena_table)
+    if source_df is not None:
+        source_df = process_data(source_df, run_date, column_mapping)
+        source_df = cast_columns(source_df, column_types)
+
+        if load_type == 'DELTA':
+            source_df = merge_with_existing_data(spark, source_df, athena_database, athena_table)
+
+        save_data(source_df, s3_csv_target_path, s3_parquet_target_path)
+
+if __name__ == "__main__":
+    main()
